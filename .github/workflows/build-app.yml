@@ -1,0 +1,32 @@
+name: Build panel APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ["panel/**"]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip openjdk-17-jdk autoconf libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
+          pip install buildozer "cython<3"
+
+      - name: Build APK
+        working-directory: panel
+        run: buildozer -v android debug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panel-apk
+          path: panel/bin/*.apk
