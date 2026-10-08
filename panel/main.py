@@ -1,5 +1,5 @@
-"""Панель управления: отправляет APK в GitHub, запускает проверку и забирает результат."""
-import base64, io, json, os, threading, time, zipfile
+"""APK Scanner v0.3: окно «проверить перед установкой» + проверка через GitHub Actions."""
+import base64, io, json, os, shutil, threading, time, zipfile
 from datetime import datetime, timedelta
 
 import requests
@@ -8,10 +8,17 @@ from kivy.clock import Clock
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.filechooser import FileChooserListView
-from kivy.uix.popup import Popup
 from kivy.uix.label import Label
+from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
+
+try:
+    from jnius import autoclass
+    from android import activity as android_activity
+    ANDROID = True
+except Exception:
+    ANDROID = False
 
 API = "https://api.github.com"
 WORKFLOW = "scan-apk.yml"
@@ -19,16 +26,66 @@ REMOTE = "incoming/app.apk"
 MAX_MB = 90
 
 
+# ---------- Android-помощники ----------
+def j_activity():
+    return autoclass("org.kivy.android.PythonActivity").mActivity
+
+
+def read_intent(intent):
+    """Если Android открыл APK через наше приложение, вернёт (uri, имя файла)."""
+    if intent is None or intent.getAction() != "android.intent.action.VIEW":
+        return None
+    uri = intent.getData()
+    if uri is None:
+        return None
+    name = "app.apk"
+    try:
+        if uri.getScheme() == "content":
+            cur = j_activity().getContentResolver().query(uri, None, None, None, None)
+            if cur is not None:
+                if cur.moveToFirst():
+                    idx = cur.getColumnIndex("_display_name")
+                    if idx >= 0:
+                        name = cur.getString(idx)
+                cur.close()
+        else:
+            name = os.path.basename(uri.getPath())
+    except Exception:
+        pass
+    return uri, name
+
+
+def copy_uri(uri, dst):
+    if uri.getScheme() == "file":
+        shutil.copyfile(uri.getPath(), dst)
+        return
+    pfd = j_activity().getContentResolver().openFileDescriptor(uri, "r")
+    fd = pfd.detachFd()
+    with os.fdopen(fd, "rb") as src, open(dst, "wb") as out:
+        shutil.copyfileobj(src, out, 1 << 20)
+
+
+def install_uri(uri):
+    """Передаёт файл системному установщику."""
+    Intent = autoclass("android.content.Intent")
+    i = Intent("android.intent.action.INSTALL_PACKAGE")
+    i.setData(uri)
+    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    j_activity().startActivity(i)
+
+
+# ---------- Интерфейс ----------
 class Panel(BoxLayout):
     def __init__(self, cfg_path, **kw):
         super().__init__(orientation="vertical", padding=10, spacing=8, **kw)
         self.cfg_path = cfg_path
+        self.cur_uri = None
         cfg = {}
         try:
             cfg = json.load(open(cfg_path))
         except Exception:
             pass
-        self.add_widget(Label(text="APK Scanner v0.2", size_hint_y=None, height=40, font_size=22))
+        self.add_widget(Label(text="APK Scanner v0.3", size_hint_y=None, height=40, font_size=22))
         self.token = TextInput(text=cfg.get("token", ""), hint_text="GitHub токен", password=True,
                                multiline=False, size_hint_y=None, height=44)
         self.repo = TextInput(text=cfg.get("repo", "abdullaevrobert9-glitch/NikeBossSSF"),
@@ -52,6 +109,80 @@ class Panel(BoxLayout):
         sv.add_widget(self.out)
         self.add_widget(sv)
 
+    # --- окна ---
+    def ask(self, text, left, right, on_left, on_right, title="APK Scanner"):
+        box = BoxLayout(orientation="vertical", padding=10, spacing=10)
+        lbl = Label(text=text, halign="center", valign="middle")
+        lbl.bind(size=lambda w, _: setattr(w, "text_size", (w.width, None)))
+        row = BoxLayout(size_hint_y=None, height=56, spacing=10)
+        bl, br = Button(text=left), Button(text=right)
+        row.add_widget(bl)
+        row.add_widget(br)
+        box.add_widget(lbl)
+        box.add_widget(row)
+        popup = Popup(title=title, content=box, size_hint=(0.92, 0.5), auto_dismiss=False)
+
+        def go(cb):
+            popup.dismiss()
+            cb()
+
+        bl.bind(on_release=lambda *_: go(on_left))
+        br.bind(on_release=lambda *_: go(on_right))
+        popup.open()
+
+    def ui(self, fn):
+        Clock.schedule_once(lambda dt: fn())
+
+    # --- сценарий «открыли APK» ---
+    def on_apk_opened(self, uri, name):
+        if name.lower().endswith("_patched.apk"):  # уже проверенная и исправленная нами копия
+            install_uri(uri)
+            return
+        self.cur_uri = uri
+        self.ask("Вы хотите установить это приложение?\n\n"
+                 "Давайте проверим этот файл на вредоносный код (вирус)?",
+                 "Не нужно", "Проверить", self.warn_skip, self.scan_opened)
+
+    def warn_skip(self):
+        self.ask("Мы настоятельно рекомендуем проверить файл. "
+                 "Установка без проверки может быть опасна.",
+                 "Всё равно установить", "Проверить",
+                 lambda: install_uri(self.cur_uri), self.scan_opened)
+
+    def scan_opened(self):
+        cfg = self.get_cfg()
+        self.out.text = "Копирую файл..."
+        self.set_busy(True)
+        threading.Thread(target=self.scan_opened_thread, args=(cfg,), daemon=True).start()
+
+    def scan_opened_thread(self, cfg):
+        try:
+            tmp = os.path.join(os.path.dirname(self.cfg_path), "incoming.apk")
+            copy_uri(self.cur_uri, tmp)
+            res = self.pipeline(dict(cfg, path=tmp))
+            if res:
+                self.ui(lambda: self.after_scan(res))
+        except Exception as e:
+            self.log(f"Ошибка: {e}")
+        finally:
+            self.set_busy(False)
+
+    def after_scan(self, res):
+        lines = res["report"].splitlines()
+        high = [l for l in lines if l.startswith("[HIGH]")]
+        risk = next((l for l in lines if l.startswith("Итоговая оценка")), "")
+        if res["patched"]:
+            self.ask(f"Найдено серьёзных признаков: {len(high)}.\n{risk}\n\n"
+                     f"Исправленная копия сохранена:\n{res['patched']}\n"
+                     "Откройте её в «Загрузках»: она установится без повторной проверки.",
+                     "Закрыть", "Установить оригинал", lambda: None,
+                     lambda: install_uri(self.cur_uri), title="Результат проверки")
+        else:
+            self.ask(f"Серьёзных угроз не найдено.\n{risk}",
+                     "Отмена", "Установить", lambda: None,
+                     lambda: install_uri(self.cur_uri), title="Результат проверки")
+
+    # --- ручной режим ---
     def pick_file(self):
         start = "/storage/emulated/0/Download"
         if not os.path.isdir(start):
@@ -60,8 +191,7 @@ class Panel(BoxLayout):
         box = BoxLayout(orientation="vertical", spacing=6)
         box.add_widget(chooser)
         row = BoxLayout(size_hint_y=None, height=54, spacing=6)
-        ok = Button(text="Выбрать")
-        cancel = Button(text="Отмена")
+        ok, cancel = Button(text="Выбрать"), Button(text="Отмена")
         row.add_widget(ok)
         row.add_widget(cancel)
         box.add_widget(row)
@@ -82,13 +212,17 @@ class Panel(BoxLayout):
     def set_busy(self, busy):
         Clock.schedule_once(lambda dt: setattr(self.btn, "disabled", busy))
 
-    def start(self):
+    def get_cfg(self):
         cfg = {"token": self.token.text.strip(), "repo": self.repo.text.strip(),
                "path": self.path.text.strip()}
         try:
             json.dump(cfg, open(self.cfg_path, "w"))
         except Exception:
             pass
+        return cfg
+
+    def start(self):
+        cfg = self.get_cfg()
         self.out.text = "Запуск..."
         self.set_busy(True)
         threading.Thread(target=self.run, args=(cfg,), daemon=True).start()
@@ -101,9 +235,12 @@ class Panel(BoxLayout):
         finally:
             self.set_busy(False)
 
+    # --- проверка через GitHub ---
     def pipeline(self, cfg):
         repo, apk = cfg["repo"], cfg["path"]
         h = {"Authorization": f"Bearer {cfg['token']}", "Accept": "application/vnd.github+json"}
+        if not cfg["token"]:
+            return self.log("Введите GitHub токен.")
         if not os.path.isfile(apk):
             return self.log("Файл не найден. Проверьте путь и доступ к файлам.")
         size = os.path.getsize(apk) / 1048576
@@ -158,20 +295,45 @@ class Panel(BoxLayout):
         out_dir = "/storage/emulated/0/Download"
         if not os.access(out_dir, os.W_OK):
             out_dir = os.path.dirname(self.cfg_path)
+        res = {"report": "", "patched": None}
         for name in z.namelist():
             data = z.read(name)
             if name.endswith("report.txt"):
-                self.log("\n" + data.decode(errors="ignore"))
+                res["report"] = data.decode(errors="ignore")
+                self.log("\n" + res["report"])
             elif name.endswith(".apk"):
                 dst = os.path.join(out_dir, os.path.basename(name))
                 open(dst, "wb").write(data)
+                res["patched"] = dst
                 self.log(f"\nИсправленный APK сохранён: {dst}")
         self.log("\nГотово.")
+        return res
 
 
 class ScanApp(App):
     def build(self):
-        return Panel(os.path.join(self.user_data_dir, "config.json"))
+        self.panel = Panel(os.path.join(self.user_data_dir, "config.json"))
+        return self.panel
+
+    def on_start(self):
+        if not ANDROID:
+            return
+        try:
+            android_activity.bind(on_new_intent=self.on_new_intent)
+            self.on_new_intent(j_activity().getIntent())
+        except Exception:
+            pass
+
+    def on_new_intent(self, intent):
+        r = read_intent(intent)
+        if r:
+            Clock.schedule_once(lambda dt: self.panel.on_apk_opened(*r))
+
+    def on_pause(self):
+        return True
+
+    def on_resume(self):
+        pass
 
 
 if __name__ == "__main__":
