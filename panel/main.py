@@ -1,4 +1,4 @@
-"""APK Scanner v0.3: окно «проверить перед установкой» + проверка через GitHub Actions."""
+"""APK Scanner v0.4: окно «проверить перед установкой», проверка на телефоне + исправление через GitHub."""
 import base64, io, json, os, shutil, threading, time, zipfile
 from datetime import datetime, timedelta
 
@@ -12,6 +12,8 @@ from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
+
+from scanner import scan_apk
 
 try:
     from jnius import autoclass
@@ -85,23 +87,29 @@ class Panel(BoxLayout):
             cfg = json.load(open(cfg_path))
         except Exception:
             pass
-        self.add_widget(Label(text="APK Scanner v0.3", size_hint_y=None, height=40, font_size=22))
+        self.add_widget(Label(text="APK Scanner v0.4", size_hint_y=None, height=40, font_size=22))
+        self.path = TextInput(text=cfg.get("path", "/storage/emulated/0/Download/"),
+                              hint_text="Путь к APK", multiline=False,
+                              size_hint_y=None, height=44)
+        self.add_widget(self.path)
+        pick = Button(text="Выбрать APK...", size_hint_y=None, height=54)
+        pick.bind(on_release=lambda *_: self.pick_file())
+        self.add_widget(pick)
+        self.btn = Button(text="Проверить на телефоне", size_hint_y=None, height=54)
+        self.btn.bind(on_release=lambda *_: self.start_local())
+        self.add_widget(self.btn)
+        self.add_widget(Label(text="Исправление через GitHub (необязательно, для разработчиков):",
+                              size_hint_y=None, height=30, font_size=13))
         self.token = TextInput(text=cfg.get("token", ""), hint_text="GitHub токен", password=True,
                                multiline=False, size_hint_y=None, height=44)
         self.repo = TextInput(text=cfg.get("repo", "abdullaevrobert9-glitch/NikeBossSSF"),
                               hint_text="владелец/репозиторий", multiline=False,
                               size_hint_y=None, height=44)
-        self.path = TextInput(text=cfg.get("path", "/storage/emulated/0/Download/"),
-                              hint_text="Путь к APK", multiline=False,
-                              size_hint_y=None, height=44)
-        for w in (self.token, self.repo, self.path):
-            self.add_widget(w)
-        pick = Button(text="Выбрать APK...", size_hint_y=None, height=54)
-        pick.bind(on_release=lambda *_: self.pick_file())
-        self.add_widget(pick)
-        self.btn = Button(text="Проверить и исправить", size_hint_y=None, height=54)
-        self.btn.bind(on_release=lambda *_: self.start())
-        self.add_widget(self.btn)
+        self.add_widget(self.token)
+        self.add_widget(self.repo)
+        self.cloud_btn = Button(text="Исправить через GitHub", size_hint_y=None, height=54)
+        self.cloud_btn.bind(on_release=lambda *_: self.start())
+        self.add_widget(self.cloud_btn)
         sv = ScrollView()
         self.out = Label(text="Готово к работе.", size_hint_y=None, halign="left", valign="top")
         self.out.bind(width=lambda *_: setattr(self.out, "text_size", (self.out.width, None)))
@@ -159,9 +167,10 @@ class Panel(BoxLayout):
         try:
             tmp = os.path.join(os.path.dirname(self.cfg_path), "incoming.apk")
             copy_uri(self.cur_uri, tmp)
-            res = self.pipeline(dict(cfg, path=tmp))
-            if res:
-                self.ui(lambda: self.after_scan(res))
+            self.log("Проверяю...")
+            res = scan_apk(tmp)
+            self.log(res["report"])
+            self.ui(lambda: self.after_scan(res))
         except Exception as e:
             self.log(f"Ошибка: {e}")
         finally:
@@ -169,17 +178,17 @@ class Panel(BoxLayout):
 
     def after_scan(self, res):
         lines = res["report"].splitlines()
-        high = [l for l in lines if l.startswith("[HIGH]")]
+        main = [l for l in lines if l.startswith(("[HIGH]", "[MEDIUM]"))][:4]
         risk = next((l for l in lines if l.startswith("Итоговая оценка")), "")
-        if res["patched"]:
-            self.ask(f"Найдено серьёзных признаков: {len(high)}.\n{risk}\n\n"
-                     f"Исправленная копия сохранена:\n{res['patched']}\n"
-                     "Откройте её в «Загрузках»: она установится без повторной проверки.",
-                     "Закрыть", "Установить оригинал", lambda: None,
+        if res["level"] == "НИЗКИЙ":
+            self.ask(f"Серьёзных признаков вредоносного кода не найдено.\n{risk}\n\n"
+                     "Это не гарантия безопасности: сканер ищет только известные приёмы.",
+                     "Отмена", "Установить", lambda: None,
                      lambda: install_uri(self.cur_uri), title="Результат проверки")
         else:
-            self.ask(f"Серьёзных угроз не найдено.\n{risk}",
-                     "Отмена", "Установить", lambda: None,
+            self.ask(f"Найдено подозрительное:\n" + "\n".join(main) + f"\n\n{risk}\n"
+                     "Установка не рекомендуется.",
+                     "Не устанавливать", "Всё равно установить", lambda: None,
                      lambda: install_uri(self.cur_uri), title="Результат проверки")
 
     # --- ручной режим ---
@@ -210,7 +219,10 @@ class Panel(BoxLayout):
         Clock.schedule_once(lambda dt: setattr(self.out, "text", self.out.text + "\n" + msg))
 
     def set_busy(self, busy):
-        Clock.schedule_once(lambda dt: setattr(self.btn, "disabled", busy))
+        def f(dt):
+            self.btn.disabled = busy
+            self.cloud_btn.disabled = busy
+        Clock.schedule_once(f)
 
     def get_cfg(self):
         cfg = {"token": self.token.text.strip(), "repo": self.repo.text.strip(),
@@ -220,6 +232,22 @@ class Panel(BoxLayout):
         except Exception:
             pass
         return cfg
+
+    def start_local(self):
+        cfg = self.get_cfg()
+        self.out.text = "Проверяю на телефоне..."
+        self.set_busy(True)
+        threading.Thread(target=self.local_thread, args=(cfg["path"],), daemon=True).start()
+
+    def local_thread(self, path):
+        try:
+            if not os.path.isfile(path):
+                return self.log("Файл не найден. Проверьте путь и доступ к файлам.")
+            self.log("\n" + scan_apk(path)["report"])
+        except Exception as e:
+            self.log(f"Ошибка: {e}")
+        finally:
+            self.set_busy(False)
 
     def start(self):
         cfg = self.get_cfg()
