@@ -7,6 +7,8 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
+from kivy.uix.filechooser import FileChooserListView
+from kivy.uix.popup import Popup
 from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
@@ -37,6 +39,9 @@ class Panel(BoxLayout):
                               size_hint_y=None, height=44)
         for w in (self.token, self.repo, self.path):
             self.add_widget(w)
+        pick = Button(text="Выбрать APK...", size_hint_y=None, height=54)
+        pick.bind(on_release=lambda *_: self.pick_file())
+        self.add_widget(pick)
         self.btn = Button(text="Проверить и исправить", size_hint_y=None, height=54)
         self.btn.bind(on_release=lambda *_: self.start())
         self.add_widget(self.btn)
@@ -46,6 +51,30 @@ class Panel(BoxLayout):
         self.out.bind(texture_size=lambda *_: setattr(self.out, "height", self.out.texture_size[1]))
         sv.add_widget(self.out)
         self.add_widget(sv)
+
+    def pick_file(self):
+        start = "/storage/emulated/0/Download"
+        if not os.path.isdir(start):
+            start = "/storage/emulated/0"
+        chooser = FileChooserListView(path=start, filters=["*.apk"])
+        box = BoxLayout(orientation="vertical", spacing=6)
+        box.add_widget(chooser)
+        row = BoxLayout(size_hint_y=None, height=54, spacing=6)
+        ok = Button(text="Выбрать")
+        cancel = Button(text="Отмена")
+        row.add_widget(ok)
+        row.add_widget(cancel)
+        box.add_widget(row)
+        popup = Popup(title="Выберите APK", content=box, size_hint=(0.95, 0.9))
+
+        def choose(*_):
+            if chooser.selection:
+                self.path.text = chooser.selection[0]
+            popup.dismiss()
+
+        ok.bind(on_release=choose)
+        cancel.bind(on_release=popup.dismiss)
+        popup.open()
 
     def log(self, msg):
         Clock.schedule_once(lambda dt: setattr(self.out, "text", self.out.text + "\n" + msg))
