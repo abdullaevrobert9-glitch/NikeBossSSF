@@ -4,7 +4,7 @@ package.name = apkscanner
 package.domain = org.nikeboss
 source.dir = .
 source.include_exts = py
-version = 0.1
+version = 0.2
 requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.0,requests,urllib3,charset-normalizer,idna,certifi
 orientation = portrait
 fullscreen = 0

@@ -28,7 +28,7 @@ class Panel(BoxLayout):
             cfg = json.load(open(cfg_path))
         except Exception:
             pass
-        self.add_widget(Label(text="APK Scanner", size_hint_y=None, height=40, font_size=22))
+        self.add_widget(Label(text="APK Scanner v0.2", size_hint_y=None, height=40, font_size=22))
         self.token = TextInput(text=cfg.get("token", ""), hint_text="GitHub токен", password=True,
                                multiline=False, size_hint_y=None, height=44)
         self.repo = TextInput(text=cfg.get("repo", "abdullaevrobert9-glitch/NikeBossSSF"),
